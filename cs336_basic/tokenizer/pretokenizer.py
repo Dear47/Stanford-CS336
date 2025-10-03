@@ -5,7 +5,7 @@ from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Iterable, Iterator, List, Tuple, BinaryIO
 from tqdm import tqdm
-from log import get_logger
+from cs336_basics.utils.log import get_logger
 logger = get_logger(__name__, 'pretokenizer.txt')
 #%%
 class PreTokenizer:

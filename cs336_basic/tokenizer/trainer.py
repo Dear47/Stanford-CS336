@@ -1,11 +1,11 @@
 #%%
 import collections
 import regex as re
-from cs336_basics.pretokenizer import PreTokenizer
+from cs336_basics.tokenizer.pretokenizer import PreTokenizer
 from typing import List, Dict, Tuple, Set
 from collections import Counter
 import heapq
-from log import get_logger
+from cs336_basics.utils.log import get_logger
 logger = get_logger(__name__, 'trainer.txt')
 #%%
 class ReversedBytesPair:
