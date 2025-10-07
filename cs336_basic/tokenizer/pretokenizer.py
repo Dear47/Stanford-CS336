@@ -2,28 +2,32 @@
 import os
 import regex as re
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Iterable, Iterator, List, Tuple, BinaryIO
+from concurrent.futures import ProcessPoolExecutor
+from typing import Iterable, Iterator, List, BinaryIO
 from tqdm import tqdm
 from cs336_basics.utils.log import get_logger
 logger = get_logger(__name__, 'pretokenizer.txt')
 #%%
 class PreTokenizer:
-    def __init__(self, special_tokens: List[str]):
+    def __init__(self, special_tokens: List[str]|None=None):
         """
         初始化预处理器
 
         Args:
             special_tokens: 特殊token列表，如 ["", "<|endoftext|>"]
         """
-        self.special_tokens = sorted(special_tokens, key=len, reverse=True)
+        if special_tokens is not None:
+            self.special_tokens = sorted(special_tokens, key=len, reverse=True)
+        else:
+            self.special_tokens = None
         self.special_tokens_pattern = (
             "|".join(re.escape(token) for token in self.special_tokens)
-            if special_tokens else r"(?!)"
+            if self.special_tokens else r"(?!)"
         )
+
         # GPT-2 兼容的分词正则
         self.word_pattern = re.compile(
-            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+$"
+            r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+$|\n+"
         )
 
     def find_chunk_boundaries(
@@ -63,7 +67,7 @@ class PreTokenizer:
                     break
 
         return sorted(set(boundaries))
-
+    
     def pretokenize(self, text: str) -> List[bytes]:
         """
         将一段文本预分词为 bytes 列表
@@ -74,14 +78,22 @@ class PreTokenizer:
         Returns:
             token 列表（每个是 bytes）
         """
-        parts = re.split(f'({self.special_tokens_pattern})', text)
-        tokens = []
-        for part in parts:
-            if part in self.special_tokens:
-                pass
-            elif part:
-                tokens.extend(match.group(0).encode('utf-8') for match in self.word_pattern.finditer(part))
-        return tokens
+        if not text:
+            return []
+        if self.special_tokens_pattern != r"(?!)":
+            parts = re.split(f'({self.special_tokens_pattern})', text)
+            tokens = []
+            for part in parts:
+                logger.debug(f"PART:{part}")
+                if part in self.special_tokens:
+                    tokens.append(part.encode('utf-8'))
+                    # pass
+                elif part:
+                    tokens.extend(match.group(0).encode('utf-8') for match in self.word_pattern.finditer(part))
+            return tokens
+        else:
+            logger.debug(f"text:{text}")
+            return [match.group(0).encode('utf-8') for match in self.word_pattern.finditer(text)]
 
     def pretokenize_iter(self, texts: Iterable[str]) -> Iterator[bytes]:
         """
@@ -96,13 +108,6 @@ class PreTokenizer:
         for text in texts:
             yield from self.pretokenize(text)
 
-    def _process_chunk(self, raw_text: str) -> List[bytes]:
-        """
-        【可被多进程调用】处理一个文本块，返回其所有 token (bytes)
-        注意：必须是实例无关的方法，或定义在模块级别才能被 pickle
-        """
-        return self.pretokenize(raw_text)
-
     def read_chunks(
         self,
         input_path: str,
@@ -110,7 +115,7 @@ class PreTokenizer:
         min_chunk_size: int = 1024  # 忽略太小的 chunk
     ) -> Iterator[str]:
         """
-        惰性读取所有 chunks（用于单进程流式处理）
+        惰性读取所有 chunks(用于单进程流式处理)
 
         Yields:
             解码后的文本 chunk
@@ -167,17 +172,16 @@ class PreTokenizer:
 
         if not chunks:
             return
-
-        # logger.debug(f"Chunk number:{len(chunks)}")
-
+        
         # 第二步：并行处理每个 chunk
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(self.pretokenize, chunk) for chunk in chunks]
+            futures = [executor.submit(self.pretokenize,chunk) for chunk in chunks]
             iter_futures = tqdm(futures, desc="Processing Chunks", disable=not use_tqdm)
 
             for future in iter_futures:
                 try:
                     tokens = future.result()
+                    # logger.debug(f"tokens:{tokens}")
                     for token in tokens:
                         yield token
                 except Exception as e:
@@ -198,13 +202,38 @@ class PreTokenizer:
         total_freq = Counter()
         for token in self.read_tokens_parallel(input_path, split_token, max_workers, use_tqdm=True):
             total_freq[token] += 1
-        # logger.debug(f"{total_freq}")
+        # logger.debug(f"total_freq:{total_freq}")
         return total_freq
     
 #%%
 if __name__ == '__main__':
+    # preprocesser = PreTokenizer(special_tokens=["<|endoftext|>"])
+    preprocesser = PreTokenizer()
+    test_text = "\n\nThis is a test text, which has 换行符.\nThis is a new line."
+    tokens = preprocesser.pretokenize(test_text)
+    logger.debug(f"tokens:{tokens}")
+    #%%
     import pathlib
-    FIXTURES_PATH = (pathlib.Path(__file__).resolve().parent.parent) / "tests/fixtures"
-    tokenizer = PreTokenizer(special_tokens=["<|endoftext|>"])
-    total_token = tokenizer.build_vocab_from_file(FIXTURES_PATH/"corpus.en",split_token='<|endoftext|>',max_workers=4)
-    print(f"{total_token}")
+    FIXTURES_PATH = (pathlib.Path(__file__).resolve().parent.parent.parent) / "tests/fixtures"
+#     text = """
+# Four score and seven years ago our fathers brought forth, on this continent, a new nation, conceived in Liberty, and dedicated to the proposition that all men are created equal.
+# Now we are engaged in a great civil war, testing whether that nation, or any nation so conceived and so dedicated, can long endure. We are met on a great battle-field of that war. We have come to dedicate a portion of that field, as a final resting place for those who here gave their lives that that nation might live. It is altogether fitting and proper that we should do this.
+# But, in a larger sense, we can not dedicate—we can not consecrate—we can not hallow—this ground. The brave men, living and dead, who struggled here, have consecrated it, far above our poor power to add or detract. The world will little note, nor long remember what we say here, but it can never forget what they did here. It is for us the living, rather, to be dedicated here to the unfinished work which they who fought here have thus far so nobly advanced. It is rather for us to be here dedicated to the great task remaining before us—that from these honored dead we take increased devotion to that cause for which they gave the last full measure of devotion—that we here highly resolve that these dead shall not have died in vain—that this nation, under God, shall have a new birth of freedom—and that government of the people, by the people, for the people, shall not perish from the earth."""
+#     token1 = preprocesser.pretokenize(text)
+#     print(f"token1:{token1}")
+#     print(f"length:{len(token1)}")
+
+#     texts = [
+#         'Four score and seven years ago our fathers brought forth, on this continent, a new nation, conceived in Liberty, and dedicated to the proposition that all men are created equal.',
+#         'Now we are engaged in a great civil war, testing whether that nation, or any nation so conceived and so dedicated, can long endure. We are met on a great battle-field of that war. We have come to dedicate a portion of that field, as a final resting place for those who here gave their lives that that nation might live. It is altogether fitting and proper that we should do this.',
+#         'But, in a larger sense, we can not dedicate—we can not consecrate—we can not hallow—this ground. The brave men, living and dead, who struggled here, have consecrated it, far above our poor power to add or detract. The world will little note, nor long remember what we say here, but it can never forget what they did here. It is for us the living, rather, to be dedicated here to the unfinished work which they who fought here have thus far so nobly advanced. It is rather for us to be here dedicated to the great task remaining before us—that from these honored dead we take increased devotion to that cause for which they gave the last full measure of devotion—that we here highly resolve that these dead shall not have died in vain—that this nation, under God, shall have a new birth of freedom—and that government of the people, by the people, for the people, shall not perish from the earth.',
+#     ]
+
+#     tokens_iter = preprocesser.pretokenize_iter(texts)
+#     length = 0
+#     for tokens in tokens_iter:
+#         print(tokens)
+#         length += 1
+#     print(f"已完成迭代")
+#     print(f"length:{length}")
+# %%

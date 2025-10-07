@@ -1,4 +1,5 @@
 #%%
+import json
 import collections
 import regex as re
 from cs336_basics.tokenizer.pretokenizer import PreTokenizer
@@ -6,6 +7,7 @@ from typing import List, Dict, Tuple, Set
 from collections import Counter
 import heapq
 from cs336_basics.utils.log import get_logger
+from tests.common import gpt2_bytes_to_unicode
 logger = get_logger(__name__, 'trainer.txt')
 #%%
 class ReversedBytesPair:
@@ -154,8 +156,15 @@ class BPETrainer:
         训练BPE
         """
         # 读取语料
-        token_freq = self.preprocessor.build_vocab_from_file(input_path=input_path,split_token="<|endoftext|>",max_workers=4)
+        token_freq:Counter[bytes,int] = self.preprocessor.build_vocab_from_file(input_path=input_path,split_token="<|endoftext|>",max_workers=4)
+        # logger.debug(f"{token_freq}")
         # logger.debug(f"[train]: Token Freq:{token_freq}")
+        bytes_special_tokens = [special_token.encode('utf-8') for special_token in self.special_tokens]
+        logger.debug(f"{bytes_special_tokens}")
+        for token in bytes_special_tokens:
+            if token in token_freq:
+                del token_freq[token]
+        
         # 开始训练
         self.vocab = {i:bytes([i]) for i in range(256)}
         num_merges = self.vocab_size - 256 - len(self.special_tokens)
@@ -181,40 +190,37 @@ class BPETrainer:
         return self.vocab, self.merges
 
 def save_file(vocab:Dict[int,bytes],merges:List[Tuple[bytes,bytes]],vocab_filepath:str,merges_filepath:str):
-    with open(vocab_filepath,'w',encoding='utf-8') as f:
-        for token_id, token in vocab.items():
-            try:
-                text = token.decode('utf-8')
-                f.write(f"{token_id}\t{text}\n")
-            except UnicodeDecodeError:
-                text = repr(token)[2:-1]
-                f.write(f"{token_id}\t{text}\n")
-    
+    byte_encoder = gpt2_bytes_to_unicode()
+    def encode_bytes(b:bytes)->str:
+        return ''.join(byte_encoder[byte] for byte in b)
+    vocab_json = {
+        encode_bytes(token): token_id 
+        for token_id, token in vocab.items()
+    }
+    with open(vocab_filepath, 'w', encoding='utf-8') as f:
+        json.dump(vocab_json, f, ensure_ascii=False, indent=2)
     with open(merges_filepath,'w',encoding='utf-8') as f:
-        for first, second in merges:
-            try:
-                left = first.decode('utf-8')
-                right = second.decode('utf-8')
-                f.write(f"{left}\t{right}\n")
-            except UnicodeDecodeError:
-                left = repr(first)[2:-1]
-                right = repr(second)[2:-1]
-                f.write(f"{left}\t{right}\n")
+        for first,second in merges:
+            left = encode_bytes(first)
+            right = encode_bytes(second)
+            f.write(f"{left} {right}\n")
 
 def train_bpe(input_path:str,vocab_size:int,special_tokens:List[str]):
+    import pathlib
+    CURRENT_PATH = pathlib.Path(__file__).resolve().parent
     tokenizer = BPETrainer(vocab_size,special_tokens)
     vocab, merges = tokenizer.train(input_path)
-    vocab_filepath = './my_vocab.txt'
-    merges_filepath = './my_merges.txt'
+    vocab_filepath = CURRENT_PATH/'my_vocab.json'
+    merges_filepath = CURRENT_PATH/'my_merges.txt'
     save_file(vocab,merges,vocab_filepath,merges_filepath)
     return vocab, merges
 
 #%%
 if __name__ == '__main__':
     import pathlib
-    FIXTURES_PATH = (pathlib.Path(__file__).resolve().parent.parent) / "tests/fixtures"
+    FIXTURES_PATH = (pathlib.Path(__file__).resolve().parent.parent.parent) / "tests/fixtures"
     input_path = FIXTURES_PATH/"corpus.en"
     # input_path = FIXTURES_PATH/"tinystories_sample.txt"
-    vocab_size = 400
+    vocab_size = 500
     special_tokens = ["<|endoftext|>"]
     vocab, merges = train_bpe(input_path, vocab_size, special_tokens)
