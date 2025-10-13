@@ -5,7 +5,7 @@ from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from typing import Iterable, Iterator, List, BinaryIO
 from tqdm import tqdm
-from cs336_basics.utils.log import get_logger
+from cs336_basics.utils.logger import get_logger
 logger = get_logger(__name__, 'pretokenizer.txt')
 #%%
 class PreTokenizer:
@@ -29,6 +29,7 @@ class PreTokenizer:
         self.word_pattern = re.compile(
             r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+$|\n+"
         )
+        self.logger = logger
 
     def find_chunk_boundaries(
         self,
@@ -84,15 +85,12 @@ class PreTokenizer:
             parts = re.split(f'({self.special_tokens_pattern})', text)
             tokens = []
             for part in parts:
-                logger.debug(f"PART:{part}")
                 if part in self.special_tokens:
                     tokens.append(part.encode('utf-8'))
-                    # pass
                 elif part:
                     tokens.extend(match.group(0).encode('utf-8') for match in self.word_pattern.finditer(part))
             return tokens
         else:
-            logger.debug(f"text:{text}")
             return [match.group(0).encode('utf-8') for match in self.word_pattern.finditer(text)]
 
     def pretokenize_iter(self, texts: Iterable[str]) -> Iterator[bytes]:
@@ -112,13 +110,17 @@ class PreTokenizer:
         self,
         input_path: str,
         split_token: str = "\n\n",
-        min_chunk_size: int = 1024  # 忽略太小的 chunk
+        min_chunk_size: int = 1024,  # 忽略太小的 chunk
+        output_tokens = False,
     ) -> Iterator[str]:
         """
         惰性读取所有 chunks(用于单进程流式处理)
 
+        Args:
+            output_tokens: 如果为 True, 直接输出 tokens; 如果为 False, 输出文本 chunks
+
         Yields:
-            解码后的文本 chunk
+            文本 chunk 或 token (bytes)
         """
         split_bytes = split_token.encode('utf-8')
         with open(input_path, 'rb') as f:
@@ -130,7 +132,12 @@ class PreTokenizer:
                 chunk_data = f.read(end - start)
                 try:
                     text = chunk_data.decode('utf-8', errors='ignore')
-                    if text.strip():
+                    if text:
+                        if output_tokens:
+                        # 直接预分词并 yield tokens
+                            yield from self.pretokenize(text)
+                    else:
+                        # 返回文本 chunk
                         yield text
                 except:
                     continue
@@ -181,11 +188,10 @@ class PreTokenizer:
             for future in iter_futures:
                 try:
                     tokens = future.result()
-                    # logger.debug(f"tokens:{tokens}")
                     for token in tokens:
                         yield token
                 except Exception as e:
-                    print(f"Error in worker: {e}")
+                    self.logger.debug(f"Error in worker: {e}")
 
     def build_vocab_from_file(
         self,
@@ -202,7 +208,6 @@ class PreTokenizer:
         total_freq = Counter()
         for token in self.read_tokens_parallel(input_path, split_token, max_workers, use_tqdm=True):
             total_freq[token] += 1
-        # logger.debug(f"total_freq:{total_freq}")
         return total_freq
     
 #%%
@@ -211,7 +216,6 @@ if __name__ == '__main__':
     preprocesser = PreTokenizer()
     test_text = "\n\nThis is a test text, which has 换行符.\nThis is a new line."
     tokens = preprocesser.pretokenize(test_text)
-    logger.debug(f"tokens:{tokens}")
     #%%
     import pathlib
     FIXTURES_PATH = (pathlib.Path(__file__).resolve().parent.parent.parent) / "tests/fixtures"

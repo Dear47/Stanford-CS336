@@ -7,7 +7,7 @@ import tqdm
 import json
 from typing import List, Dict, Tuple, Iterable, Union
 from cs336_basics.tokenizer.pretokenizer import PreTokenizer
-from cs336_basics.utils.log import get_logger
+from cs336_basics.utils.logger import get_logger
 logger = get_logger(__name__,'bpetokenzier.txt')
 from tests.common import gpt2_bytes_to_unicode
 #%%
@@ -24,10 +24,10 @@ class BPETokenizer:
         self.byte_encoder: Dict[int, str] = gpt2_bytes_to_unicode()
         self.byte_decoder: Dict[str, int] = {v:k for k,v in self.byte_encoder.items()}
 
-        # logger.debug(f"Special Tokens: {[special_token for special_token in special_tokens]}")
         self.preprocesser = PreTokenizer(special_tokens)
         self.cache: Dict[bytes,List[int]] = {}  # 有待优化
-    
+        self.logger = logger
+
     @classmethod
     def from_files(cls, vocab_path:str, merges_path:str, special_tokens:List[str]|None=None):
         byte_encoder: Dict[int, str] = gpt2_bytes_to_unicode()
@@ -71,7 +71,6 @@ class BPETokenizer:
         将bytes类型的token编码成vocab中的id
         """
         origin_token = token
-        # logger.debug(f"origin token:{origin_token}")
         token_id:List[int] = []
         if token in self.cache:
             "如果token在缓存中, 直接获取其id"
@@ -106,7 +105,7 @@ class BPETokenizer:
                     id = self.encoder[t]
                     token_id.append(id)
                 except KeyError:
-                    logger.debug(f"Token {token} not found in Vocab!")
+                    self.logger.debug(f"Token {token} not found in Vocab!")
             self.cache[origin_token] = token_id  # 放入缓存
         return token_id
 
@@ -115,33 +114,31 @@ class BPETokenizer:
         将文本编码成BPE token id列表
         """
         tokens:List[bytes] = self.pretokenizer(text)
-        # logger.debug(f"PreTokens:{tokens}")
         id_list:List[int] = []
         for token in tokens:
             token_id = self.get_token_id(token)
             id_list += token_id
-            # logger.debug(f"Encode Token {token} to ID {token_id}")
         return id_list
 
     def encode_iterable(self, iterable:Iterable[str])->Iterable[int]:
+        """
+        惰性编码
+        """
         tokens_iter = self.pretokenizer_iter(iterable)
         for token in tokens_iter:
             token_id = self.get_token_id(token)
             yield from token_id
-        
+
     def decode(self, ids:List[int])->str:
         bytes_text = b""
-        # logger.debug(f"-"*60)
         for id in ids:
             if id in self.decoder:
                 bytes_token = self.decoder[id]
                 bytes_text+= bytes_token
-                # logger.debug(f"Decode ID {id} to Token {bytes_token}")
             else:
-                logger.debug(f"ID {id} is not in Vocab!")
-        # logger.debug(f"decode {ids} to bytes_text {bytes_text}")
-        return bytes_text.decode('utf-8',errors='replace')
-        
+                self.logger.debug(f"ID {id} is not in Vocab!")
+        return bytes_text.decode('utf-8',errors='replace')      
+
     def encode_to_npfile(self, input_path: os.PathLike, output_path: os.PathLike, 
                         memory_threshold_ratio: float = 0.5) -> None:
         """
@@ -160,24 +157,24 @@ class BPETokenizer:
         estimated_memory_bytes = estimated_tokens * 2  # uint16 = 2 bytes
         estimated_memory_mb = estimated_memory_bytes / (1024 * 1024)
         
-        logger.debug(f"File Size: {file_size_mb:.2f} MB")
-        logger.debug(f"Estimated Token Number: {estimated_tokens:,}")
-        logger.debug(f"Estimated Memory Usage: {estimated_memory_mb:.2f} MB")
+        self.logger.debug(f"File Size: {file_size_mb:.2f} MB")
+        self.logger.debug(f"Estimated Token Number: {estimated_tokens:,}")
+        self.logger.debug(f"Estimated Memory Usage: {estimated_memory_mb:.2f} MB")
         
         # 2. 检查可用内存
         available_memory = psutil.virtual_memory().available
         available_memory_mb = available_memory / (1024 * 1024)
         max_allowed_memory = available_memory * memory_threshold_ratio
         
-        logger.debug(f"Avaiable Memory: {available_memory_mb:.2f} MB")
-        logger.debug(f"Max Allowed Memory: {max_allowed_memory / (1024 * 1024):.2f} MB")
+        self.logger.debug(f"Avaiable Memory: {available_memory_mb:.2f} MB")
+        self.logger.debug(f"Max Allowed Memory: {max_allowed_memory / (1024 * 1024):.2f} MB")
         
         # 3. 选择保存策略
         if estimated_memory_bytes <= max_allowed_memory:
-            logger.debug("Save directly(sufficient memory)...")
+            self.logger.debug("Save directly(sufficient memory)...")
             self._save_direct_method(input_path, output_path, estimated_tokens)
         else:
-            logger.debug("Save streamingly(out of memory)...")
+            self.logger.debug("Save streamingly(out of memory)...")
             self._save_streaming_method(input_path, output_path)
 
     def _estimate_token_count(self, input_path: os.PathLike) -> tuple[int, float]:
@@ -233,7 +230,7 @@ class BPETokenizer:
         
         # 直接保存为uint16数组
         np.save(output_path, np.array(token_ids, dtype=np.uint16))
-        logger.debug(f"Save File to: {output_path}\nToTal Token Number: {len(token_ids)}")
+        self.logger.debug(f"Save File to: {output_path}\nToTal Token Number: {len(token_ids)}")
 
     def _save_streaming_method(self, input_path: os.PathLike, output_path: os.PathLike) -> None:
         """流式保存方法 - 适用于内存不足的情况"""
@@ -254,7 +251,7 @@ class BPETokenizer:
             tmpfile_path = tmpfile.name
         
         # 读取临时文件创建memmap，并保存为.npy
-        logger.debug("Save to the file...")
+        self.logger.debug("Save to the file...")
         try:
             mm_array = np.memmap(tmpfile_path, dtype=np.uint16, mode='r', shape=(token_count,))
             np.save(output_path, mm_array)
@@ -262,7 +259,7 @@ class BPETokenizer:
         finally:
             os.remove(tmpfile_path)
         
-        logger.debug(f"Save File to: {output_path}\nToTal Token Number: {token_count}")
+        self.logger.debug(f"Save File to: {output_path}\nToTal Token Number: {token_count}")
 #%%
 if __name__ == '__main__':
     import pathlib
@@ -273,3 +270,4 @@ if __name__ == '__main__':
         vocab_path=VOCAB_PATH,
         merges_path=MERGES_PATH,
     )
+# %%

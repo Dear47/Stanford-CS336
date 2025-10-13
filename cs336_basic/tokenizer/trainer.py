@@ -6,7 +6,7 @@ from cs336_basics.tokenizer.pretokenizer import PreTokenizer
 from typing import List, Dict, Tuple, Set
 from collections import Counter
 import heapq
-from cs336_basics.utils.log import get_logger
+from cs336_basics.utils.logger import get_logger
 from tests.common import gpt2_bytes_to_unicode
 logger = get_logger(__name__, 'trainer.txt')
 #%%
@@ -37,6 +37,7 @@ class BPETrainer:
         self.token_freq: Dict[list[bytes], int] = {}
         self.pair_to_token: Dict[Tuple[bytes, bytes], Set[bytes]] = {}  # 记录每一个字节对所对应的token(不断更新)
         self.freq_max_heap = []
+        self.logger = logger
 
     def _push_pair_to_heap(self, pair:Tuple[bytes, bytes], freq:int):
         """
@@ -62,20 +63,15 @@ class BPETrainer:
         """
         由于best_pair合并, 会在相关token中产生new_pair, 同时old_pair会消失, 应该考虑这两者的变化
         """
-        # logger.debug(f"------------------------------------------------------------------")
         self.pair_to_token.setdefault(new_pair_part,set()).add(token)
-        # logger.debug(f"[_update_pair_freq]: Add {token} to {new_pair_part}:{self.pair_to_token[new_pair_part]}")
         self.pair_freq[new_pair_part] = self.pair_freq.get(new_pair_part,0)+freq  # freq是受影响的token的频率
-        # logger.debug(f"[_update_pair_freq]: Pair {new_pair_part}'s freq increase {freq}")
         self._push_pair_to_heap(new_pair_part,self.pair_freq[new_pair_part])
 
         if old_pair_part in self.pair_freq:
             self.pair_freq[old_pair_part] -= freq
-            # logger.debug(f"[_update_pair_freq]: Pair {old_pair_part}'s freq decrease {freq}")
             if self.pair_freq[old_pair_part] <= 0:
                 del self.pair_freq[old_pair_part]
                 del self.pair_to_token[old_pair_part]
-                # logger.debug(f"[_update_pair_freq]: {old_pair_part}'freq <= 0, delete!")
             else:
                 self._push_pair_to_heap(old_pair_part,self.pair_freq[old_pair_part])
 
@@ -101,10 +97,6 @@ class BPETrainer:
         for pair, freq in self.pair_freq.items():
             self._push_pair_to_heap(pair,freq)
         
-        # logger.debug(f"[initialize_splits_and_pairs]: Initial Splits:{self.splits}")
-        # logger.debug(f"[initialize_splits_and_pairs]: Initial Pair Freq:{self.pair_freq}")
-        # logger.debug(f"[initialize_splits_and_pairs]: Initial Pair to Token:{self.pair_to_token}")
-
     def find_best_pair(self)->Tuple[bytes,bytes]:
         return self._pop_pair_from_heap()
 
@@ -114,21 +106,17 @@ class BPETrainer:
         """
         for idx, token in enumerate(self.special_tokens):
             self.vocab[self.vocab_size-len(self.special_tokens)+idx] = token.encode('utf-8')
-            # logger.debug(f"[add_special_token]: Add Special Token: {token.encode('utf-8')}")
-
+            
     def merge(self,best_pair:Tuple[bytes,bytes],new_token:bytes,token_freq:Counter):
         """
         合并字节对, 并更新pair_freq
         """
         affected_tokens = list(self.pair_to_token.get(best_pair, set()))
-        # logger.debug(f"[merge]: Affected Tokens:{affected_tokens}")
-
+        
         if best_pair in self.pair_freq:
             # 删除pair_freq中的best_pair
-            # logger.debug(f"[merge]: Delete Pair Freq:{self.pair_freq[best_pair]}")
             del self.pair_freq[best_pair]
         if best_pair in self.pair_to_token:
-            # logger.debug(f"[merge]: Delete Pair_to_Token:{self.pair_to_token[best_pair]}")
             del self.pair_to_token[best_pair]
 
         for token in affected_tokens:
@@ -157,10 +145,8 @@ class BPETrainer:
         """
         # 读取语料
         token_freq:Counter[bytes,int] = self.preprocessor.build_vocab_from_file(input_path=input_path,split_token="<|endoftext|>",max_workers=4)
-        # logger.debug(f"{token_freq}")
-        # logger.debug(f"[train]: Token Freq:{token_freq}")
         bytes_special_tokens = [special_token.encode('utf-8') for special_token in self.special_tokens]
-        logger.debug(f"{bytes_special_tokens}")
+        self.logger.debug(f"{bytes_special_tokens}")
         for token in bytes_special_tokens:
             if token in token_freq:
                 del token_freq[token]
@@ -173,7 +159,6 @@ class BPETrainer:
         self.initialize_splits_and_pairs(token_freq)
 
         for num_merge in range(num_merges):
-            # logger.debug(f"[train]: ===================== Iteration: {num_merge} =========================")
             if not self.pair_freq:
                 break
 
@@ -182,8 +167,7 @@ class BPETrainer:
 
             new_token = best_pair[0]+best_pair[1]
             self.vocab[256+num_merge] = new_token
-            # logger.debug(f"[train]: Best Pair:{best_pair}, New Token:{new_token}")
-
+            
             self.merge(best_pair,  new_token, token_freq)
 
         self.add_special_token()
@@ -210,8 +194,8 @@ def train_bpe(input_path:str,vocab_size:int,special_tokens:List[str]):
     CURRENT_PATH = pathlib.Path(__file__).resolve().parent
     tokenizer = BPETrainer(vocab_size,special_tokens)
     vocab, merges = tokenizer.train(input_path)
-    vocab_filepath = CURRENT_PATH/'my_vocab.json'
-    merges_filepath = CURRENT_PATH/'my_merges.txt'
+    vocab_filepath = CURRENT_PATH/'tinystories_vocab.json'
+    merges_filepath = CURRENT_PATH/'tinystories_merges.txt'
     save_file(vocab,merges,vocab_filepath,merges_filepath)
     return vocab, merges
 
@@ -219,8 +203,8 @@ def train_bpe(input_path:str,vocab_size:int,special_tokens:List[str]):
 if __name__ == '__main__':
     import pathlib
     FIXTURES_PATH = (pathlib.Path(__file__).resolve().parent.parent.parent) / "tests/fixtures"
-    input_path = FIXTURES_PATH/"corpus.en"
-    # input_path = FIXTURES_PATH/"tinystories_sample.txt"
-    vocab_size = 500
+    # input_path = FIXTURES_PATH/"corpus.en"
+    input_path = FIXTURES_PATH/"tinystories_sample.txt"
+    vocab_size = 1000
     special_tokens = ["<|endoftext|>"]
     vocab, merges = train_bpe(input_path, vocab_size, special_tokens)
