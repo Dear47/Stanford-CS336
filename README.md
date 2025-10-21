@@ -12,13 +12,13 @@ cs336_basics
 |   ├── transformer_utils.py      # 训练相关工具（loss、优化器等）
 |   ├── trainer.py          # 模型训练脚本
 |   └── inference.py      # 推理脚本
-├── data              # 存放数据集、vocab、merges和模型权重文件
-|   ├── merges        # 合并规则
-|   ├── model         # 模型权重/检查点
-|   ├── token         # .npy文件
-|   ├── vocab         # 字典
+└── data              # 存放数据集、vocab、merges和模型权重文件
+    ├── merges        # 合并规则
+    ├── model         # 模型权重/检查点
+    ├── token         # .npy文件
+    ├── vocab         # 字典
 ```
-cs336-assignment1:
+cs336-assignment1:<br>
 /cs336_basic/tokenizer:实现作业1的BPE训练和分词<br>
 /cs336_basic/transformer: 实现作业1的transformer_lm的各个模块，并完成了最终训练<br>
 将原项目的cs336_basic文件夹和tests/adapters.py替换掉即可<br>
