@@ -3,7 +3,7 @@ import os
 import sys
 import psutil
 import numpy as np
-import tqdm
+from tqdm import tqdm
 import json
 from typing import List, Dict, Tuple, Iterable, Union
 from cs336_basics.tokenizer.pretokenizer import PreTokenizer
@@ -263,11 +263,14 @@ class BPETokenizer:
 #%%
 if __name__ == '__main__':
     import pathlib
-    FIXTURES_PATH = (pathlib.Path(__file__).resolve().parent.parent.parent)/"tests/fixtures"
-    VOCAB_PATH = FIXTURES_PATH/'gpt2_vocab.json'
-    MERGES_PATH = FIXTURES_PATH/'gpt2_merges.txt'
+    PATH = pathlib.Path(__file__).resolve().parent.parent
+    VOCAB_PATH = PATH/'data/vocab/owt_vocab.json' # TinyStoriesV2-GPT4 / owt
+    MERGES_PATH = PATH/'data/merges/owt_merges.txt'
+    INPUT_PATH = PATH/'data/owt_valid.txt'
     tokenizer = BPETokenizer.from_files(
         vocab_path=VOCAB_PATH,
         merges_path=MERGES_PATH,
     )
+    tokenizer.encode_to_npfile(input_path=INPUT_PATH,
+                               output_path=PATH/'data/token/owt_valid.npy')
 # %%

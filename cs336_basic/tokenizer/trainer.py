@@ -1,6 +1,5 @@
 #%%
 import json
-import collections
 import regex as re
 from cs336_basics.tokenizer.pretokenizer import PreTokenizer
 from typing import List, Dict, Tuple, Set
@@ -8,7 +7,7 @@ from collections import Counter
 import heapq
 from cs336_basics.utils.logger import get_logger
 from tests.common import gpt2_bytes_to_unicode
-logger = get_logger(__name__, 'trainer.txt')
+logger = get_logger(__name__, 'bpe_trainer.txt')
 #%%
 class ReversedBytesPair:
     """
@@ -173,7 +172,7 @@ class BPETrainer:
         self.add_special_token()
         return self.vocab, self.merges
 
-def save_file(vocab:Dict[int,bytes],merges:List[Tuple[bytes,bytes]],vocab_filepath:str,merges_filepath:str):
+def save_file(vocab:Dict[int,bytes],merges:List[Tuple[bytes,bytes]],vocab_filepath:str,merges_filepath:str)->None:
     byte_encoder = gpt2_bytes_to_unicode()
     def encode_bytes(b:bytes)->str:
         return ''.join(byte_encoder[byte] for byte in b)
@@ -189,22 +188,24 @@ def save_file(vocab:Dict[int,bytes],merges:List[Tuple[bytes,bytes]],vocab_filepa
             right = encode_bytes(second)
             f.write(f"{left} {right}\n")
 
-def train_bpe(input_path:str,vocab_size:int,special_tokens:List[str]):
+def train_bpe(input_path:str,vocab_size:int,special_tokens:List[str])->Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
     import pathlib
-    CURRENT_PATH = pathlib.Path(__file__).resolve().parent
+    PATH = pathlib.Path(__file__).resolve().parent.parent
     tokenizer = BPETrainer(vocab_size,special_tokens)
     vocab, merges = tokenizer.train(input_path)
-    vocab_filepath = CURRENT_PATH/'tinystories_vocab.json'
-    merges_filepath = CURRENT_PATH/'tinystories_merges.txt'
+    vocab_filepath = PATH/'data/vocab/owt-valid_vocab.json'
+    merges_filepath = PATH/'data/merges/owt-valid_merges.txt'
     save_file(vocab,merges,vocab_filepath,merges_filepath)
     return vocab, merges
 
 #%%
 if __name__ == '__main__':
     import pathlib
-    FIXTURES_PATH = (pathlib.Path(__file__).resolve().parent.parent.parent) / "tests/fixtures"
+    # FIXTURES_PATH = (pathlib.Path(__file__).resolve().parent.parent.parent) / "tests/fixtures"
     # input_path = FIXTURES_PATH/"corpus.en"
-    input_path = FIXTURES_PATH/"tinystories_sample.txt"
-    vocab_size = 1000
+    # input_path = FIXTURES_PATH/"tinystories_sample.txt"
+    # input_path = pathlib.Path(__file__).resolve().parent.parent/'data/TinyStoriesV2-GPT4-valid.txt'
+    input_path = pathlib.Path(__file__).resolve().parent.parent/'data/owt_valid.txt'
+    vocab_size = 32000
     special_tokens = ["<|endoftext|>"]
     vocab, merges = train_bpe(input_path, vocab_size, special_tokens)

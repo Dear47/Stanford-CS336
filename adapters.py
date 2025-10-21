@@ -430,9 +430,9 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    from cs336_basics.transformer.module import TransformLM
+    from cs336_basics.transformer.module import TransformerLM
     try:
-        TransLM = TransformLM(vocab_size,context_length,num_layers,d_model,num_heads,d_ff,rope_theta,eps=1e-5)
+        TransLM = TransformerLM(vocab_size,context_length,num_layers,d_model,num_heads,d_ff,rope_theta,eps=1e-5)
         TransLM.load_state_dict({
             "embedding.weight":weights['token_embeddings.weight'],
             "OLinear.weight":weights['lm_head.weight'],
@@ -506,7 +506,11 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer.module import silu
+    try:
+        return silu(in_features)
+    except:
+        raise NotImplementedError
 
 
 def run_get_batch(
@@ -529,7 +533,11 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer.transformer_utils import get_batch
+    try:
+        return get_batch(dataset,batch_size,context_length,device)
+    except:
+        raise NotImplementedError
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -567,7 +575,11 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer.transformer_utils import cross_entropy
+    try:
+        return cross_entropy(inputs,targets)
+    except:
+        raise NotImplementedError
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -579,14 +591,22 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer.transformer_utils import gradient_clipping
+    try:
+        return gradient_clipping(parameters,max_l2_norm)
+    except:
+        raise NotImplementedError
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer.transformer_utils import AdamW
+    try:
+        return AdamW
+    except:
+        raise NotImplementedError
 
 
 def run_get_lr_cosine_schedule(
@@ -614,7 +634,11 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer.transformer_utils import cosine_annealing_schedule
+    try:
+        return cosine_annealing_schedule(it,max_learning_rate,min_learning_rate,warmup_iters,cosine_cycle_iters)
+    except:
+        raise NotImplementedError
 
 
 def run_save_checkpoint(
@@ -633,7 +657,11 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer.transformer_utils import save_checkpoint
+    try:
+        return save_checkpoint(model,optimizer,iteration,out)
+    except:
+        raise NotImplementedError
 
 
 def run_load_checkpoint(
@@ -654,7 +682,11 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer.transformer_utils import load_checkpoint
+    try:
+        return load_checkpoint(src,model,optimizer)
+    except:
+        raise NotImplementedError
 
 
 def get_tokenizer(
