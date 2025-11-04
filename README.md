@@ -24,7 +24,7 @@ cs336_basics
     ├── token         # .npy文件
     ├── vocab         # 字典
 ```
-![image](results.png)
+![image](training_results.png)
 cs336-assignment2:<br>
 用pytorch和triton分别实现flashattention的前向传播和反向传播算法<br>
 ```
