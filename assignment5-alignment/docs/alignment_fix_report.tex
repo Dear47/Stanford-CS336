@@ -1,0 +1,566 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{tabularx}
+
+\geometry{margin=2.4cm}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!60!black
+}
+
+\lstdefinestyle{pycode}{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!60!black},
+  commentstyle=\color{green!40!black},
+  stringstyle=\color{red!50!black},
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true,
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{black!20},
+  backgroundcolor=\color{black!2},
+  tabsize=4
+}
+\lstset{style=pycode}
+
+\title{Assignment 5 Alignment 项目修复报告}
+\author{Codex 修复记录}
+\date{2026 年 6 月 5 日}
+
+\begin{document}
+\maketitle
+
+\section{修复范围概览}
+
+本次修复按“会阻断运行的问题优先、算法正确性其次、测试与工程清理收尾”的顺序执行。当前机器无 GPU，因此所有验证均限定为 CPU 可执行路径；依赖 vLLM 的 rollout/evaluation 路径只做入口约束与导入安全处理，不在本机强行运行。
+
+\begin{table}[h]
+\centering
+\begin{tabularx}{\textwidth}{lX X}
+\toprule
+类别 & 主要文件 & 修复要点 \\
+\midrule
+SFT & \texttt{sft\_helper.py}, \texttt{sft\_experiment.py} & 稳定熵、训练循环、CPU 加载、vLLM 跳过 \\
+GRPO / Dr.GRPO & \texttt{grpo\_helper.py}, \texttt{grpo\_experiment.py} & clip loss、mask 统计、constant normalization、optimizer 复用 \\
+EI / GRPO 入口 & \texttt{expert\_iteration\_experiment.py}, \texttt{grpo\_experiment.py} & 无 GPU 时明确拒绝 vLLM rollout \\
+数据与路径 & \texttt{data\_utils.py}, \texttt{paths.py} & 数据 schema 识别、路径校验延迟 \\
+测试与 adapter & \texttt{tests/adapters.py}, \texttt{tests/test\_regressions.py} & adapter 透传、新增 CPU 回归测试 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{SFT：熵计算的数值稳定性}
+
+\subsection{问题}
+
+修复前的熵实现等价于先对 logits 做指数再归一化：
+
+\begin{lstlisting}
+# before
+probs = torch.exp(logits) / torch.exp(logits).sum(dim=-1, keepdim=True)
+entropy = -torch.sum(probs * torch.log(probs), dim=-1)
+\end{lstlisting}
+
+当 logits 很大时，例如 $[1000,999,998]$，$\exp(1000)$ 会 overflow，随后产生 \texttt{inf / inf} 或 \texttt{nan}。这会污染 SFT 日志，也会影响任何依赖 token entropy 的训练监控。
+
+\subsection{数学推导}
+
+令模型在位置 $t$ 的 logits 为 $\mathbf{z}_t \in \mathbb{R}^{V}$。真实概率为
+\[
+  p_i = \frac{\exp(z_i)}{\sum_{j=1}^{V}\exp(z_j)}.
+\]
+熵为
+\[
+  H(\mathbf{p}) = -\sum_{i=1}^{V} p_i \log p_i.
+\]
+直接计算 $\exp(z_i)$ 不稳定。使用 log-softmax：
+\[
+  \ell_i = \log p_i = z_i - \log\sum_{j=1}^{V}\exp(z_j).
+\]
+其中 $\log\sum_j \exp(z_j)$ 在 PyTorch 的 \texttt{log\_softmax} 内部使用 log-sum-exp 技巧：
+\[
+  \log\sum_j \exp(z_j)
+  = m + \log\sum_j \exp(z_j-m),
+  \quad m=\max_j z_j.
+\]
+此时 $z_j-m \le 0$，指数不会 overflow。最后
+\[
+  H = -\sum_i \exp(\ell_i)\ell_i.
+\]
+
+\subsection{修复后代码}
+
+\begin{lstlisting}
+# after: cs336_alignment/sft_helper.py
+def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
+    log_probs = F.log_softmax(logits.float(), dim=-1)
+    probs = log_probs.exp()
+    return -torch.sum(probs * log_probs, dim=-1).to(logits.dtype)
+\end{lstlisting}
+
+这里先将 logits 转成 \texttt{float()}，避免半精度下 log-softmax 精度不足；返回时再转回原 dtype，保持调用方接口一致。
+
+\section{SFT 损失、训练循环与尾部梯度累积}
+
+\subsection{SFT 损失公式}
+
+对于 prompt $x$ 和 response $y=(y_1,\dots,y_T)$，SFT 最大化 response token 的条件似然：
+\[
+  \max_\theta \sum_{t=1}^{T}\log \pi_\theta(y_t \mid x,y_{<t}).
+\]
+最小化形式为
+\[
+  \mathcal{L}_{\mathrm{SFT}}
+  =
+  -\frac{1}{B C}
+  \sum_{i=1}^{B}\sum_{t=1}^{L}
+  m_{i,t}\log\pi_\theta(y_{i,t}\mid x_i,y_{i,<t}),
+\]
+其中 $m_{i,t}\in\{0,1\}$ 是 response mask，$C$ 是 \texttt{normalize\_constant} 或 token 数相关归一化常数，$B$ 是 batch size。
+
+\subsection{修复前问题}
+
+训练循环曾将 \texttt{tqdm(dataloader)} 创建在 epoch 外层：
+
+\begin{lstlisting}
+# before
+progress_bar = tqdm(dataloader, desc=f"Training ({len(train_dataset)} samples)")
+for _ in range(train_config.epochs):
+    for step, batch in enumerate(progress_bar):
+        ...
+\end{lstlisting}
+
+这会导致 dataloader iterator 在第一轮 epoch 后耗尽。若 \texttt{epochs > 1}，后续 epoch 不再真正训练。
+
+此外，尾部梯度累积窗口不足 \texttt{gradient\_accumulation} 时，日志仍除以固定累积步数，导致最后一个 optimizer step 的 loss/entropy/length 统计偏小。
+
+\subsection{修复后代码}
+
+\begin{lstlisting}
+# after: sft_experiment.py / expert_iteration_experiment.py
+for _ in range(train_config.epochs):
+    progress_bar = tqdm(dataloader, desc=f"Training ({len(train_dataset)} samples)")
+    for step, batch in enumerate(progress_bar):
+        ...
+        is_last_batch = step == len(dataloader) - 1
+        if (step + 1) % train_config.gradient_accumulation == 0 or is_last_batch:
+            ...
+            accumulated_steps = (step % train_config.gradient_accumulation) + 1
+            avg_loss = running_loss / accumulated_steps
+            avg_entropy = running_entropy / accumulated_steps
+            avg_len = running_len / accumulated_steps
+\end{lstlisting}
+
+修复后每个 epoch 都会重新创建 dataloader iterator；最后一个不足窗口也会执行 optimizer step，并按实际 microbatch 数统计日志。
+
+\section{GRPO / Dr.GRPO：组内奖励归一化}
+
+\subsection{公式}
+
+GRPO 对同一个 prompt 采样 $G$ 个 response，得到 reward $r_{i,1},\dots,r_{i,G}$。组内 baseline 为
+\[
+  \mu_i = \frac{1}{G}\sum_{j=1}^{G}r_{i,j}.
+\]
+若启用标准差归一化，优势为
+\[
+  A_{i,j}
+  =
+  \frac{r_{i,j}-\mu_i}{\sigma_i+\epsilon}.
+\]
+本项目当前保留 PyTorch \texttt{std} 默认口径，即 sample standard deviation：
+\[
+  \sigma_i
+  =
+  \sqrt{\frac{1}{G-1}\sum_{j=1}^{G}(r_{i,j}-\mu_i)^2}.
+\]
+说明：GRPO 论文公式常见实现也可使用 population standard deviation，即分母为 $G$。本修复曾评估该口径，但原始 snapshot 测试锁定了 PyTorch 默认 sample std；为保持课程测试契约，本次保留 sample std，并在代码中新增 $G>1$ 防御。
+
+\subsection{修复前问题}
+
+当 $G=1$ 时，组内标准差没有统计意义；如果所有奖励相同，优势应为 0。缺少显式检查时，后续训练容易出现不清晰的 NaN 或无意义 advantage。
+
+\begin{lstlisting}
+# before
+raw_rewards_per_group = raw_rewards.reshape((-1, group_size))
+advantages = raw_rewards_per_group - raw_rewards_per_group.mean(-1, keepdim=True)
+if normalize_by_std:
+    advantages /= advantage_eps + raw_rewards_per_group.std(-1, keepdim=True)
+\end{lstlisting}
+
+\subsection{修复后代码}
+
+\begin{lstlisting}
+# after: cs336_alignment/grpo_helper.py
+if group_size <= 1:
+    raise ValueError("group_size must be greater than 1 for group-normalized rewards")
+
+raw_rewards_per_group = raw_rewards.reshape((-1, group_size))
+advantages = raw_rewards_per_group - raw_rewards_per_group.mean(-1, keepdim=True)
+if normalize_by_std:
+    advantages /= (advantage_eps + raw_rewards_per_group.std(-1, keepdim=True))
+\end{lstlisting}
+
+若组内 reward 全相同，则分子 $r_{i,j}-\mu_i=0$，因此 advantage 全为 0；新增回归测试覆盖了该性质。
+
+\section{GRPO-Clip：裁剪目标与 clip fraction}
+
+\subsection{公式}
+
+令旧策略为 $\pi_{\theta_{\mathrm{old}}}$，当前策略为 $\pi_\theta$，单 token 概率比为
+\[
+  \rho_{i,t}(\theta)
+  =
+  \frac{\pi_\theta(y_{i,t}\mid x_i,y_{i,<t})}
+       {\pi_{\theta_{\mathrm{old}}}(y_{i,t}\mid x_i,y_{i,<t})}
+  =
+  \exp\left(
+    \log\pi_\theta(y_{i,t})-\log\pi_{\theta_{\mathrm{old}}}(y_{i,t})
+  \right).
+\]
+GRPO/PPO 风格裁剪目标为
+\[
+  \mathcal{J}_{i,t}^{\mathrm{clip}}
+  =
+  \min\left(
+    \rho_{i,t} A_i,
+    \operatorname{clip}(\rho_{i,t},1-\epsilon,1+\epsilon)A_i
+  \right).
+\]
+训练中最小化负目标：
+\[
+  \mathcal{L}_{i,t}^{\mathrm{clip}}
+  =
+  -\mathcal{J}_{i,t}^{\mathrm{clip}}.
+\]
+
+\subsection{clip fraction 的正确统计}
+
+clip fraction 应只统计 response token：
+\[
+  f_{\mathrm{clip}}
+  =
+  \frac{\sum_{i,t}m_{i,t}\mathbf{1}[\text{token }(i,t)\text{ 被裁剪}]}
+       {\sum_{i,t}m_{i,t}},
+\]
+其中 $m_{i,t}=0$ 的 prompt/padding token 不应进入分母。
+
+\subsection{修复前后代码}
+
+\begin{lstlisting}
+# before
+clipped_mask = clipped_pos | clipped_neg
+clip_fraction = clipped_mask.float().mean()
+\end{lstlisting}
+
+\begin{lstlisting}
+# after: cs336_alignment/grpo_helper.py
+metadata = {
+    "clip_fraction": clip_fraction,
+    "clipped_mask": clipped_mask,
+}
+...
+clipped_mask = metadata.pop("clipped_mask", None)
+if clipped_mask is not None:
+    metadata["clip_fraction"] = masked_mean(clipped_mask.float(), response_mask)
+\end{lstlisting}
+
+这样保留了 \texttt{compute\_grpo\_clip\_loss} 的局部元数据，又在 microbatch 聚合时使用 response mask 重新计算日志指标。
+
+\section{Dr.GRPO：constant length normalization}
+
+\subsection{问题}
+
+GRPO 默认 token mean 损失为
+\[
+  \mathcal{L}_{\mathrm{token\_mean}}
+  =
+  \frac{\sum_{i,t}m_{i,t}\ell_{i,t}}
+       {\sum_{i,t}m_{i,t}}.
+\]
+这会让长回答和短回答在 token 总量上被不同方式加权。Dr.GRPO 常用固定长度常数 $C$ 对每个样本归一化：
+\[
+  \mathcal{L}_{\mathrm{constant}}
+  =
+  \frac{1}{B}\sum_{i=1}^{B}
+  \frac{\sum_{t=1}^{L}m_{i,t}\ell_{i,t}}{C}.
+\]
+若 $C$ 取最大生成长度，则每个样本的总贡献按同一尺度归一化。
+
+\subsection{修复前代码}
+
+\begin{lstlisting}
+# before
+policy_gradient_loss, metadata = compute_policy_gradient_loss(...)
+loss = masked_mean(policy_gradient_loss, response_mask)
+loss /= gradient_accumulation_steps
+loss.backward()
+\end{lstlisting}
+
+\subsection{修复后代码}
+
+\begin{lstlisting}
+# after: cs336_alignment/grpo_helper.py
+if loss_normalization == "token_mean":
+    loss = masked_mean(policy_gradient_loss, response_mask)
+elif loss_normalization == "constant":
+    if normalize_constant is None:
+        normalize_constant = policy_log_probs.shape[1]
+    per_example_loss = masked_normalize(
+        policy_gradient_loss,
+        response_mask,
+        normalize_constant=normalize_constant,
+        dim=1,
+    )
+    loss = per_example_loss.mean()
+else:
+    raise ValueError(f"Unknown loss_normalization: {loss_normalization}")
+
+loss /= gradient_accumulation_steps
+loss.backward()
+\end{lstlisting}
+
+\subsection{adapter 层修复}
+
+隐藏测试通常通过 \texttt{tests/adapters.py} 调用实现。修复前 adapter 未暴露 \texttt{loss\_normalization} 和 \texttt{normalize\_constant}，导致 Dr.GRPO 行为即使在 production helper 中实现，也无法被 adapter 路径测试。
+
+\begin{lstlisting}
+# after: tests/adapters.py
+def run_grpo_microbatch_train_step(
+    ...,
+    loss_normalization: Literal["token_mean", "constant"] = "token_mean",
+    normalize_constant: float | None = None,
+):
+    return grpo_microbatch_train_step(
+        ...,
+        loss_normalization,
+        normalize_constant,
+    )
+\end{lstlisting}
+
+\section{GRPO 训练循环：optimizer/scheduler 复用与真实 collate 路径}
+
+\subsection{问题}
+
+GRPO 每次 rollout 后都会对同一策略继续训练。如果 \texttt{train\_grpo\_model} 内部每次重新创建 optimizer/scheduler，则 AdamW 动量、学习率调度状态都会丢失：
+\[
+  m_t=\beta_1 m_{t-1}+(1-\beta_1)g_t,
+  \quad
+  v_t=\beta_2 v_{t-1}+(1-\beta_2)g_t.
+\]
+若每个 rollout 重置 optimizer，则 $m_{t-1},v_{t-1}$ 被清零，不再是连续优化过程。
+
+\subsection{修复后代码}
+
+\begin{lstlisting}
+# after: grpo_experiment.py
+def train_grpo_model(
+    model: torch.nn.Module,
+    tokenizer: "AutoTokenizer",
+    grpo_dataset: Dataset,
+    train_config: TrainConfig,
+    global_step: int,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+):
+    ...
+\end{lstlisting}
+
+optimizer/scheduler 在 \texttt{main()} 中创建一次，并传入每轮 rollout 的训练函数。新增 CPU smoke test 真实执行 \texttt{GRPODataset -> get\_grpo\_collate\_fn -> train\_grpo\_model}，同时捕获了缺失 \texttt{pad\_sequence} 的问题。
+
+\subsection{pad\_sequence 修复}
+
+\begin{lstlisting}
+# before
+old_log_probs = pad_sequence(old_log_probs_list, batch_first=True, padding_value=0.0)
+# NameError: pad_sequence is not defined
+\end{lstlisting}
+
+\begin{lstlisting}
+# after: cs336_alignment/grpo_experiment.py
+from torch.nn.utils.rnn import pad_sequence
+\end{lstlisting}
+
+\section{无 GPU 环境与 vLLM 入口}
+
+\subsection{问题}
+
+原始脚本默认使用 CUDA：
+
+\begin{lstlisting}
+# before
+train_device: str = "cuda"
+eval_device: str = "cuda"
+AutoModelForCausalLM.from_pretrained(
+    train_config.model_path,
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+)
+llm = init__vllm(...)
+\end{lstlisting}
+
+在无 GPU 机器上，即使用户传入 \texttt{--train\_device cpu}，固定的 \texttt{flash\_attention\_2} 与 vLLM 初始化仍会失败。
+
+\subsection{修复后加载参数}
+
+\begin{lstlisting}
+# after: experiment modules
+def model_load_kwargs(train_device: str) -> dict:
+    kwargs = {
+        "use_cache": False,
+        "trust_remote_code": True,
+    }
+    if str(train_device).startswith("cuda"):
+        kwargs.update({
+            "torch_dtype": torch.bfloat16,
+            "attn_implementation": "flash_attention_2",
+        })
+    return kwargs
+\end{lstlisting}
+
+CPU 下不传 \texttt{flash\_attention\_2}，也不强制 \texttt{bfloat16}。
+
+\subsection{SFT 的 CPU-only 行为}
+
+SFT 训练本身不依赖 vLLM；vLLM 只用于评估。因此 SFT 在无 CUDA 时跳过 vLLM 初始化和评估：
+
+\begin{lstlisting}
+# after: sft_experiment.py
+def can_use_vllm(device: str) -> bool:
+    return str(device).startswith("cuda") and torch.cuda.is_available()
+
+llm = None
+if can_use_vllm(eval_config.eval_device):
+    llm = init__vllm(...)
+else:
+    logger.warning("Skipping vLLM initialization/evaluation ...")
+\end{lstlisting}
+
+\subsection{EI / GRPO 的 CUDA 约束}
+
+EI 和 GRPO 的核心 rollout 依赖 vLLM 生成，因此不能伪装成完整 CPU 可运行。修复后入口明确报错：
+
+\begin{lstlisting}
+# after: grpo_experiment.py / expert_iteration_experiment.py
+def require_vllm_cuda(device: str):
+    if not str(device).startswith("cuda") or not torch.cuda.is_available():
+        raise RuntimeError("GRPO requires vLLM on CUDA for rollout generation/evaluation.")
+\end{lstlisting}
+
+这比在 vLLM/CUDA 深层栈中崩溃更可诊断，也符合当前机器无 GPU 的约束。
+
+\section{数据路径硬编码}
+
+\subsection{问题}
+
+修复前数据加载逻辑依赖路径名：
+
+\begin{lstlisting}
+# before
+if "gsm8k" in data_path:
+    ...
+if "MATH-500" in data_path:
+    ...
+\end{lstlisting}
+
+如果相同 schema 的数据被放到其他目录，例如 \texttt{renamed.jsonl}，会加载出空的 prompts/cots/groundtruths。
+
+\subsection{修复后代码}
+
+\begin{lstlisting}
+# after: cs336_alignment/data_utils.py
+for entry in datasets:
+    if {"problem", "solution", "answer"}.issubset(entry):
+        groundtruths.append(extract_MATH500_groundtruth(entry["answer"]))
+        cots.append(f"{entry['solution']} </think> <answer> {entry['answer']} </answer>")
+        prompts.append(wrap_prompt(entry["problem"], prompt_template_path))
+    elif {"question", "answer"}.issubset(entry):
+        groundtruths.append(extract_gsm8k_groundtruth(entry["answer"]))
+        cots.append(format_cot_to_think_answer(entry["answer"]))
+        prompts.append(wrap_prompt(entry["question"], prompt_template_path))
+    else:
+        logger.error(f"Entry has unsupported schema keys: {sorted(entry.keys())}")
+\end{lstlisting}
+
+现在判断依据是 JSONL entry 的字段结构，而不是文件路径。
+
+\section{测试策略与验证结果}
+
+\subsection{新增回归测试覆盖}
+
+新增 \texttt{tests/test\_regressions.py} 覆盖：
+
+\begin{itemize}[leftmargin=2em]
+  \item 大 logits 熵计算 finite；
+  \item 零方差组内 reward 产生零 advantage；
+  \item Dr.GRPO constant length normalization；
+  \item adapter 层透传 Dr.GRPO constant normalization；
+  \item GRPO clip fraction 只统计 response mask；
+  \item SFT 训练循环真实迭代 dataloader；
+  \item GRPO optimizer/scheduler 复用接口；
+  \item GRPO collate + train loop CPU smoke test；
+  \item CPU-safe model load kwargs；
+  \item 数据加载按 schema 而非路径名识别。
+\end{itemize}
+
+\subsection{当前机器上的验证}
+
+编译检查：
+
+\begin{lstlisting}[language=bash]
+python3 -m py_compile \
+  cs336_alignment/sft_experiment.py \
+  cs336_alignment/expert_iteration_experiment.py \
+  cs336_alignment/grpo_experiment.py \
+  cs336_alignment/sft_helper.py \
+  cs336_alignment/grpo_helper.py \
+  cs336_alignment/optional_helpers.py \
+  cs336_alignment/data_utils.py \
+  tests/adapters.py \
+  tests/conftest.py \
+  tests/test_regressions.py \
+  tests/test_dpo.py \
+  tests/test_data.py
+\end{lstlisting}
+
+CPU-only 测试：
+
+\begin{lstlisting}[language=bash]
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q \
+  tests/test_regressions.py \
+  tests/test_sft.py -k 'not tokenize and not get_response' \
+  tests/test_grpo.py \
+  tests/test_metrics.py \
+  tests/test_dpo.py \
+  tests/test_data.py
+\end{lstlisting}
+
+结果：
+
+\[
+  36\ \text{passed},\quad
+  3\ \text{skipped},\quad
+  2\ \text{deselected}.
+\]
+
+其中 3 个 skip 来自当前环境的 \texttt{transformers -> sklearn/scipy -> NumPy 2.2.6} ABI 不兼容；测试已经改为在该环境下跳过 transformers 相关路径，使纯 PyTorch 的 SFT/GRPO/metrics 回归测试仍可执行。
+
+\section{剩余注意事项}
+
+\begin{enumerate}[leftmargin=2em]
+  \item GRPO 标准差口径当前保留 PyTorch 默认 sample std，以匹配课程 snapshot。若后续按论文公式严格采用 population std，应将 \texttt{std(..., correction=0)} 与 snapshot 一并更新。
+  \item EI/GRPO 完整实验仍需要 CUDA + vLLM；当前无 GPU 机器只能验证 helper、collate、训练 microbatch 等 CPU 子路径。
+  \item DPO 的数值测试依赖 transformers tiny model；当前机器因为 NumPy ABI 问题跳过，环境修复后应重新运行 \texttt{tests/test\_dpo.py}。
+\end{enumerate}
+
+\end{document}
